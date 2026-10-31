@@ -14,7 +14,7 @@ def setup_argparse():
     Sets up the argument parser for the CLI.
     """
     parser = argparse.ArgumentParser(description="Detects drift between IaC templates and deployed infrastructure.")
-    parser.add_argument("-t", "--template", required=True, help="Path to the IaC template file (e.g., Terraform or Kubernetes YAML).")
+    parser.add_argument("-t", "--template", required=True, help="Path to the IaC template file (YAML or JSON).")
     parser.add_argument("-p", "--provider", required=True, choices=['terraform', 'pulumi', 'kubernetes'], help="Infrastructure provider (terraform, pulumi, kubernetes).")
     parser.add_argument("-s", "--state", required=True, help="Path to the state file or live infrastructure details (e.g., Terraform state, Pulumi stack, Kubernetes cluster config).")
     parser.add_argument("-o", "--output", default="drift_report.txt", help="Output file for the drift report (default: drift_report.txt).")
@@ -50,34 +50,22 @@ def load_iac_template(template_path):
 
 def load_infrastructure_state(state_path, provider):
     """
-    Loads the infrastructure state based on the provider.
-    For Terraform, reads the state file.
-    For Pulumi and Kubernetes, attempts to retrieve live infrastructure details.
+    Loads the infrastructure state from the state file for every provider.
+    Terraform state files are JSON. Pulumi and Kubernetes state files are
+    read as JSON or YAML, matching the file extension.
     """
     try:
         if provider == 'terraform':
             with open(state_path, 'r') as f:
                 return json.load(f)
-        elif provider == 'pulumi':
-            # Implement Pulumi stack retrieval here.  Requires Pulumi CLI setup and login.
-            # Example (replace with actual Pulumi command):
-            # pulumi_cmd = ["pulumi", "stack", "output", "--json"]
-            # result = subprocess.run(pulumi_cmd, capture_output=True, text=True, check=True)
-            # return json.loads(result.stdout)
-
-            # Placeholder:
-            logging.warning("Pulumi state retrieval is not fully implemented. Returning empty dictionary.")
-            return {}
-        elif provider == 'kubernetes':
-            # Implement Kubernetes resource retrieval here.  Requires kubectl access.
-            # Example (replace with actual kubectl commands):
-            # kubectl_cmd = ["kubectl", "get", "pods", "-o", "json"]
-            # result = subprocess.run(kubectl_cmd, capture_output=True, text=True, check=True)
-            # return json.loads(result.stdout)
-
-            # Placeholder:
-            logging.warning("Kubernetes state retrieval is not fully implemented. Returning empty dictionary.")
-            return {}
+        elif provider in ('pulumi', 'kubernetes'):
+            with open(state_path, 'r') as f:
+                if state_path.endswith(('.yaml', '.yml')):
+                    return yaml.safe_load(f)
+                elif state_path.endswith('.json'):
+                    return json.load(f)
+                else:
+                    raise ValueError("Unsupported state file format.  Must be YAML or JSON.")
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
@@ -94,29 +82,54 @@ def load_infrastructure_state(state_path, provider):
         logging.error(f"Error loading infrastructure state: {e}")
         raise
 
+def _collect_differences(template_data, state_data, path, differences):
+    """
+    Walks both structures and appends one line per differing path, naming
+    the path and both values.
+    """
+    if isinstance(template_data, dict) and isinstance(state_data, dict):
+        for key in sorted(set(template_data) | set(state_data), key=str):
+            child_path = f"{path}.{key}" if path else str(key)
+            if key not in template_data:
+                differences.append(f"Difference at {child_path}: template=<absent>, state={state_data[key]!r}")
+            elif key not in state_data:
+                differences.append(f"Difference at {child_path}: template={template_data[key]!r}, state=<absent>")
+            else:
+                _collect_differences(template_data[key], state_data[key], child_path, differences)
+    elif isinstance(template_data, list) and isinstance(state_data, list):
+        if len(template_data) != len(state_data):
+            differences.append(
+                f"Difference at {path or 'root'}: template has {len(template_data)} item(s), "
+                f"state has {len(state_data)} item(s)"
+            )
+        for index, (template_item, state_item) in enumerate(zip(template_data, state_data)):
+            _collect_differences(template_item, state_item, f"{path}[{index}]", differences)
+    elif template_data != state_data:
+        differences.append(f"Difference at {path or 'root'}: template={template_data!r}, state={state_data!r}")
+
+
 def compare_infrastructure(template_data, state_data, jsonpath_expression=None):
     """
     Compares the IaC template with the infrastructure state.
-    If jsonpath_expression is provided, it filters the state data before comparison.
+    If jsonpath_expression is provided, it filters both sides before
+    comparison. Returns one line per differing path, or the no
+    differences line when the two sides match.
     """
-    differences = []
-
     if jsonpath_expression:
         try:
             jsonpath_expr = parse(jsonpath_expression)
+            template_data = [match.value for match in jsonpath_expr.find(template_data)]
             state_data = [match.value for match in jsonpath_expr.find(state_data)]
         except Exception as e:
             logging.error(f"Error applying JSONPath expression: {e}")
             raise
 
-    # Basic comparison - replace with more sophisticated logic as needed.
-    #  This is a placeholder and needs to be adapted to the specific IaC structure.
-    if template_data != state_data:
-        differences.append("Significant differences detected between template and state.")
-    else:
-        differences.append("No significant differences detected.")
+    differences = []
+    _collect_differences(template_data, state_data, "", differences)
 
-    return differences
+    if differences:
+        return ["Significant differences detected between template and state:"] + differences
+    return ["No significant differences detected."]
 
 def write_report(report, output_file):
     """
@@ -145,12 +158,20 @@ def main():
             raise FileNotFoundError(f"State file not found: {args.state}")
 
 
+        resolved_output = os.path.realpath(args.output)
+        if resolved_output in (os.path.realpath(args.template), os.path.realpath(args.state)):
+            raise ValueError(f"Output path resolves to an input file, refusing to overwrite it: {args.output}")
+
         template_data = load_iac_template(args.template)
         state_data = load_infrastructure_state(args.state, args.provider)
 
         differences = compare_infrastructure(template_data, state_data, args.jsonpath)
 
         write_report(differences, args.output)
+
+        if any(line.startswith("Difference at ") for line in differences):
+            logging.warning("Drift detected between template and state.")
+            exit(1)
 
     except FileNotFoundError as e:
         print(f"Error: {e}")
