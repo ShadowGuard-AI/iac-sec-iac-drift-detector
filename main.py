@@ -55,6 +55,9 @@ def load_infrastructure_state(state_path, provider):
     read as JSON or YAML, matching the file extension.
     """
     try:
+        # The provider choice changes only how the state file is parsed.
+        # Terraform state is always read as JSON, whatever its extension says,
+        # while the template's format is chosen by its extension alone.
         if provider == 'terraform':
             with open(state_path, 'r') as f:
                 return json.load(f)
@@ -102,8 +105,16 @@ def _collect_differences(template_data, state_data, path, differences):
                 f"Difference at {path or 'root'}: template has {len(template_data)} item(s), "
                 f"state has {len(state_data)} item(s)"
             )
+        # Lists are compared positionally, over the zip of both. When the
+        # lengths differ, the length line above is the only report about the
+        # extra items; their contents are never compared, and a reordering of
+        # the same items reads as a difference at every moved index.
         for index, (template_item, state_item) in enumerate(zip(template_data, state_data)):
             _collect_differences(template_item, state_item, f"{path}[{index}]", differences)
+    # Leaf comparison is plain inequality, so types count: the number 1
+    # and the string 1 differ, and a YAML yes parsed as a boolean differs
+    # from a JSON true only in spelling, not in value, which the structures
+    # cannot show after parsing.
     elif template_data != state_data:
         differences.append(f"Difference at {path or 'root'}: template={template_data!r}, state={state_data!r}")
 
@@ -118,6 +129,11 @@ def compare_infrastructure(template_data, state_data, jsonpath_expression=None):
     if jsonpath_expression:
         try:
             jsonpath_expr = parse(jsonpath_expression)
+            # The expression filters both sides into flat lists of matched values,
+            # and the walk then compares those lists positionally. The comparison
+            # is only meaningful when the expression matches the same things in
+            # the same order on both sides; an extra match on one side shifts
+            # every later pairing.
             template_data = [match.value for match in jsonpath_expr.find(template_data)]
             state_data = [match.value for match in jsonpath_expr.find(state_data)]
         except Exception as e:
@@ -167,6 +183,9 @@ def main():
 
         differences = compare_infrastructure(template_data, state_data, args.jsonpath)
 
+        # The report is written before the exit code is decided. A run that
+        # finds drift leaves a complete report on disk and then exits 1, so a
+        # caller gets the evidence and the failure signal together.
         write_report(differences, args.output)
 
         if any(line.startswith("Difference at ") for line in differences):
